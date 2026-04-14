@@ -1,0 +1,79 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+*.pyd
+*.dll
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+projetvenv/
+
+# Packaging
+build/
+dist/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Environment variables / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Streamlit cache / local state
+.streamlit/secrets.toml
+
+# Generated data outputs (pipeline)
+nyt_articles_raw.csv
+weekly_green_subsidy_index.csv
+regression_results.csv
+weekly_index_plot.png
+regression_diagnostic.png
+
+# Durable storage proposed
+data/runs/
+data/registry/
+data/manifest.json
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+#documents
+
+*.pdf
+CLAUDE.md

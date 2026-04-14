@@ -1,0 +1,26 @@
+# NYT Green Subsidy Index Pipeline — Acharya et al. (2025)
+# Python 3.11+
+
+# --- Async HTTP ---
+aiohttp>=3.9,<4.0
+
+# --- Data & Stats ---
+pandas>=2.1,<3.0
+numpy>=1.25,<2.0
+statsmodels>=0.14,<1.0
+
+# --- Visualization ---
+matplotlib>=3.8,<4.0
+plotly>=5.18,<6.0
+
+# --- LLM client (OpenAI-compatible, used for Local AI Stack) ---
+openai>=1.12,<2.0
+
+# --- Dashboard ---
+streamlit>=1.30,<2.0
+
+# --- Progress bars ---
+tqdm>=4.66,<5.0
+
+# --- Environment variables ---
+python-dotenv>=1.0,<2.0

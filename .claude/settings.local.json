@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"C:/Users/loicn/Documents/Master 2 ETEEN/Projet Economie/projetvenv/Scripts/python.exe\" --version)"
+    ]
+  }
+}
