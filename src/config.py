@@ -13,11 +13,34 @@ from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
+# Try to detect Streamlit environment
+try:
+    import streamlit as st
+    _STREAMLIT_MODE = True
+except ImportError:
+    _STREAMLIT_MODE = False
+
 # ---------------------------------------------------------------------------
 # Load .env from project root (auto-detect)
+# Only works locally. Streamlit Cloud uses st.secrets instead.
 # ---------------------------------------------------------------------------
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(_PROJECT_ROOT / ".env")
+if not _STREAMLIT_MODE:
+    load_dotenv(_PROJECT_ROOT / ".env")
+
+# ---------------------------------------------------------------------------
+# Helper: load config from Streamlit secrets or env vars
+# ---------------------------------------------------------------------------
+def _get_config_value(key: str, default: str = "") -> str:
+    """
+    Load config from: Streamlit secrets (cloud) → env var (local) → default
+    """
+    if _STREAMLIT_MODE:
+        try:
+            return st.secrets.get(key, default).strip()
+        except Exception:
+            pass
+    return os.getenv(key, default).strip()
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -88,13 +111,13 @@ class PipelineConfig:
     local_ai_base_url: str = "http://127.0.0.1:9485/v1"
     local_model_name: str = "local-model"
 
-    # NYT API — loaded from .env automatically
-    nyt_api_key: str = field(default_factory=lambda: os.getenv("NYT_API_KEY", "").strip())
-    nyt_api_secret: str = field(default_factory=lambda: os.getenv("NYT_API_SECRET", "").strip())
+    # NYT API — loaded from Streamlit secrets (cloud) or .env (local)
+    nyt_api_key: str = field(default_factory=lambda: _get_config_value("NYT_API_KEY"))
+    nyt_api_secret: str = field(default_factory=lambda: _get_config_value("NYT_API_SECRET"))
     nyt_rate_limit_delay: float = 12.0  # seconds between Archive API calls
 
-    # FRED API — loaded from .env
-    fred_api_key: str = field(default_factory=lambda: os.getenv("FRED_API_KEY", "").strip())
+    # FRED API — loaded from Streamlit secrets (cloud) or .env (local)
+    fred_api_key: str = field(default_factory=lambda: _get_config_value("FRED_API_KEY"))
 
     # Hardware throttle (AMD 8 GB shared VRAM)
     max_concurrent_llm: int = 3
