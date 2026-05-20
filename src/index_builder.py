@@ -49,7 +49,11 @@ def build_weekly_index(df: pd.DataFrame) -> pd.DataFrame:
 
     # Fill missing weeks with 0
     if not weekly.empty:
-        full_range = pd.date_range(weekly["week_start"].min(), weekly["week_start"].max(), freq="W-MON")
+        # .normalize() strips the time component (12:34:30 → 00:00:00)
+        # so that week_start aligns with FRED data (which is always midnight)
+        start = weekly["week_start"].min().normalize()
+        end = weekly["week_start"].max().normalize()
+        full_range = pd.date_range(start, end, freq="W-MON")
         full_weeks = pd.DataFrame({"week_start": full_range})
         full_weeks["year_week"] = (
             full_weeks["week_start"].dt.isocalendar().year.astype(str)
@@ -60,6 +64,10 @@ def build_weekly_index(df: pd.DataFrame) -> pd.DataFrame:
         weekly["index_score"] = weekly["index_score"].fillna(0)
         weekly["n_articles"] = weekly["n_articles"].fillna(0).astype(int)
         weekly["avg_importance"] = weekly["avg_importance"].fillna(0)
+
+    # Strip timezone to avoid merge conflicts with FRED (naive) datetimes
+    if weekly["week_start"].dt.tz is not None:
+        weekly["week_start"] = weekly["week_start"].dt.tz_localize(None)
 
     log.info(f"Weekly index: {len(weekly)} weeks, non-zero: {(weekly['index_score'] != 0).sum()}")
     return weekly

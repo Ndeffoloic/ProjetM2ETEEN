@@ -1,7 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "Bash(\"C:/Users/loicn/Documents/Master 2 ETEEN/Projet Economie/projetvenv/Scripts/python.exe\" --version)"
+      "Bash(\"C:/Users/loicn/Documents/Master 2 ETEEN/Projet Economie/projetvenv/Scripts/python.exe\" --version)",
+      "Bash('C:/Users/loicn/Documents/Master 2 ETEEN/Projet Economie/projetvenv/Scripts/python.exe' -c ':*)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('app.py: syntax OK'\\)\")",
+      "Bash(python -c \"from src.fred_data import fetch_energy_prices; from src.regression import run_regression; from src.config import PipelineConfig; print\\('All imports OK'\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(timeout 15 streamlit run app.py --server.headless true)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }

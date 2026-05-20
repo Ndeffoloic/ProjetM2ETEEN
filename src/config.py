@@ -34,25 +34,48 @@ log = logging.getLogger("pipeline")
 # ---------------------------------------------------------------------------
 SUBSIDY_PATTERNS: list[re.Pattern] = [
     re.compile(r"\bsubsid(?:y|ies|ize|ized|izing)\b", re.IGNORECASE),
-    re.compile(r"\btax\s+credit\b", re.IGNORECASE),
+    re.compile(r"\btax\s+credit(?:s)?\b", re.IGNORECASE),
     re.compile(r"\bgrant(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bincentive(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\brebate(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bloan\s+guarantee\b", re.IGNORECASE),
+    re.compile(r"\bproduction\s+tax\s+credit\b", re.IGNORECASE),
+    re.compile(r"\binvestment\s+tax\s+credit\b", re.IGNORECASE),
+    re.compile(r"\bfeed[- ]in[- ]tariff\b", re.IGNORECASE),
+    re.compile(r"\bgreen\s+industrial\s+policy\b", re.IGNORECASE),
+    re.compile(r"\bclimate\s+(?:bill|package|act|law|legislation)\b", re.IGNORECASE),
 ]
 
 ENERGY_PATTERNS: list[re.Pattern] = [
     re.compile(r"\brenewable(?:s)?\b", re.IGNORECASE),
     re.compile(r"\bsolar\b", re.IGNORECASE),
-    re.compile(r"\bwind\s+(?:energy|power|farm|turbine)\b", re.IGNORECASE),
+    re.compile(r"\bwind\s+(?:energy|power|farm|turbine|project)s?\b", re.IGNORECASE),
+    re.compile(r"\bwind\b", re.IGNORECASE),
     re.compile(r"\bgreen\s+energy\b", re.IGNORECASE),
     re.compile(r"\bclean\s+energy\b", re.IGNORECASE),
+    re.compile(r"\bclean\s+power\b", re.IGNORECASE),
     re.compile(r"\binflation\s+reduction\s+act\b", re.IGNORECASE),
     re.compile(r"\bIRA\b"),
-    re.compile(r"\bfeed[- ]in[- ]tariff\b", re.IGNORECASE),
     re.compile(r"\bEUA(?:s)?\b"),
+    re.compile(r"\benergy\s+transition\b", re.IGNORECASE),
+    re.compile(r"\belectric\s+vehicl\w*\b", re.IGNORECASE),
+    re.compile(r"\bbatter(?:y|ies)\b", re.IGNORECASE),
+    re.compile(r"\bhydrogen\b", re.IGNORECASE),
+    re.compile(r"\boffshore\s+wind\b", re.IGNORECASE),
+    re.compile(r"\bcarbon\b", re.IGNORECASE),
+    re.compile(r"\bemission(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bfossil\s+fuel\b", re.IGNORECASE),
+    re.compile(r"\boil\b", re.IGNORECASE),
+    re.compile(r"\bnatural\s+gas\b", re.IGNORECASE),
+    re.compile(r"\bnuclear\b", re.IGNORECASE),
+    re.compile(r"\bheat\s+pump\b", re.IGNORECASE),
+    re.compile(r"\benergy\s+efficien\w*\b", re.IGNORECASE),
 ]
 
 ALLOWED_SECTIONS: set[str] = {
     "business", "climate", "energy", "national", "financial",
     "us", "world", "science", "your money",
+    "politics", "washington", "environment",
 }
 
 
@@ -69,6 +92,9 @@ class PipelineConfig:
     nyt_api_key: str = field(default_factory=lambda: os.getenv("NYT_API_KEY", "").strip())
     nyt_api_secret: str = field(default_factory=lambda: os.getenv("NYT_API_SECRET", "").strip())
     nyt_rate_limit_delay: float = 12.0  # seconds between Archive API calls
+
+    # FRED API — loaded from .env
+    fred_api_key: str = field(default_factory=lambda: os.getenv("FRED_API_KEY", "").strip())
 
     # Hardware throttle (AMD 8 GB shared VRAM)
     max_concurrent_llm: int = 3
@@ -94,3 +120,7 @@ class PipelineConfig:
     @property
     def has_nyt_key(self) -> bool:
         return bool(self.nyt_api_key) and self.nyt_api_key != "VOTRE_CLE_API_NYT_ICI"
+
+    @property
+    def has_fred_key(self) -> bool:
+        return bool(self.fred_api_key)

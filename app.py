@@ -14,17 +14,18 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import plotly.express as px
-from plotly.subplots import make_subplots
+import plotly.graph_objects as go
 import statsmodels.api as sm
 import streamlit as st
+from plotly.subplots import make_subplots
 
 from src.config import PipelineConfig, log
-from src.scraper import scrape_nyt
-from src.scorer import score_articles
+from src.fred_data import fetch_energy_prices
 from src.index_builder import build_weekly_index
 from src.regression import run_regression
+from src.scorer_tfidf import score_articles_tfidf
+from src.scraper import scrape_nyt
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -148,16 +149,16 @@ weekly_df = pd.DataFrame()
 # NYT LIVE SCRAPING
 # ------------------------------------------------------------------
 if data_source == "🔴 NYT Live (API)":
-    st.sidebar.success(f"Cle API NYT detectee ({cfg.nyt_api_key[:8]}...)")
+    st.sidebar.success(f"Cle API NYT detectee")
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("Parametres de scraping")
 
-    year_options = list(range(2018, 2027))
+    year_options = list(range(2013, 2026))
     selected_years = st.sidebar.multiselect(
         "Annees a scraper",
         year_options,
-        default=[2022, 2023, 2024],
+        default=[2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025],
     )
     selected_months = st.sidebar.multiselect(
         "Mois (vide = tous)",
@@ -169,10 +170,11 @@ if data_source == "🔴 NYT Live (API)":
         ][m - 1],
     )
 
-    use_llm = st.sidebar.checkbox(
-        "Scorer via Local AI Stack (port 9485)",
-        value=False,
-        help="Necessite que votre Docker Local AI Stack soit actif.",
+    scorer_choice = st.sidebar.radio(
+        "Methode de scoring",
+        ["TF-IDF + LR (CPU, recommande)", "Heuristique (mots-cles)"],
+        index=0,
+        help="TF-IDF+LR : classifieur entraine, CPU only.",
     )
 
     # --- Launch button ---
@@ -187,7 +189,9 @@ if data_source == "🔴 NYT Live (API)":
         with st.spinner("📥 Scraping NYT Archive API..."):
             progress = st.progress(0, text="Demarrage...")
             import aiohttp
-            from src.filters import passes_section_filter, passes_keyword_filter
+
+            from src.filters import (passes_keyword_filter,
+                                     passes_section_filter)
 
             async def scrape_with_progress():
                 all_articles = []
@@ -262,36 +266,26 @@ if data_source == "🔴 NYT Live (API)":
             df_raw = df_raw.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
             st.success(f"✅ {len(df_raw)} articles pertinents recuperes !")
 
-            # -- Stage 2: LLM scoring (optional) --
-            if use_llm:
-                with st.spinner("🧠 Scoring via Local AI Stack..."):
-                    df_raw = _run_async(score_articles(df_raw, scrape_cfg))
+            # -- Stage 2: Scoring ---
+            if scorer_choice.startswith("TF-IDF"):
+                with st.spinner("🧠 Scoring TF-IDF + Logistic Regression (CPU)..."):
+                    df_raw = score_articles_tfidf(df_raw)
+                st.success("Scoring TF-IDF+LR termine.")
             else:
-                # Simple heuristic scoring without LLM
-                st.info("💡 Scoring heuristique (sans LLM). Activez le scoring LLM pour plus de precision.")
-                from src.filters import passes_keyword_filter
-                from src.config import SUBSIDY_PATTERNS, ENERGY_PATTERNS
-
-                df_raw["relevance"] = 1  # already keyword-filtered
+                # Heuristic fallback
+                st.info("Scoring heuristique (mots-cles uniquement).")
+                df_raw["relevance"] = 1
                 directions = []
                 importances = []
                 for _, row in df_raw.iterrows():
                     txt = row["text_to_analyze"].lower()
-                    # Direction heuristic
                     pos_words = ["increase", "boost", "expand", "new", "sign", "approve",
                                  "extend", "launch", "invest", "billion", "fund"]
                     neg_words = ["cut", "repeal", "block", "reduce", "end", "cancel",
                                  "phase out", "eliminate", "halt", "oppose"]
                     pos = sum(1 for w in pos_words if w in txt)
                     neg = sum(1 for w in neg_words if w in txt)
-                    if pos > neg:
-                        directions.append(1)
-                    elif neg > pos:
-                        directions.append(-1)
-                    else:
-                        directions.append(0)
-
-                    # Importance heuristic
+                    directions.append(1 if pos > neg else (-1 if neg > pos else 0))
                     if any(w in txt for w in ["inflation reduction act", "ira ", "green deal",
                                                "trillion", "historic", "landmark"]):
                         importances.append(3)
@@ -299,7 +293,6 @@ if data_source == "🔴 NYT Live (API)":
                         importances.append(2)
                     else:
                         importances.append(1)
-
                 df_raw["direction"] = directions
                 df_raw["importance"] = importances
                 df_raw["rationale"] = "heuristic"
@@ -348,21 +341,17 @@ elif data_source == "📂 CSV existant":
 else:
     scored_df, weekly_df = generate_demo_data()
 
-# --- Regression params ---
-st.sidebar.markdown("---")
-st.sidebar.subheader("Parametres de regression")
-synthetic_beta = st.sidebar.slider(
-    "Beta synthetique (Green Paradox < 0 / Fossilflation > 0)",
-    min_value=-0.05, max_value=0.05, value=-0.005, step=0.001, format="%.3f",
-)
-noise_std = st.sidebar.slider("Ecart-type du bruit", 0.005, 0.10, 0.03, 0.005)
-
 # --- Date filter ---
 st.sidebar.markdown("---")
 st.sidebar.subheader("Filtres temporels")
 if weekly_df is not None and not weekly_df.empty:
+    # Ensure timezone-naive AND time-stripped for date filter & merge with FRED
+    if weekly_df["week_start"].dt.tz is not None:
+        weekly_df["week_start"] = weekly_df["week_start"].dt.tz_localize(None)
+    weekly_df["week_start"] = weekly_df["week_start"].dt.normalize()  # 12:34:30 → 00:00:00
     min_date = weekly_df["week_start"].min().date()
     max_date = weekly_df["week_start"].max().date()
+    st.sidebar.caption(f"Donnees disponibles : {min_date} a {max_date}")
     date_range = st.sidebar.date_input(
         "Periode", value=(min_date, max_date),
         min_value=min_date, max_value=max_date,
@@ -446,6 +435,7 @@ with tab1:
             x=weekly_df["week_start"], y=weekly_df["n_articles"],
             mode="lines", name="Nb. articles",
             line=dict(color="#3498db", width=1.5), opacity=0.6,
+            fill="tozeroy", fillcolor="rgba(52,152,219,0.08)",
         ),
         secondary_y=True,
     )
@@ -461,12 +451,26 @@ with tab1:
             secondary_y=False,
         )
 
+    # Align zeros: compute axis ranges so 0 is at the same vertical position
+    idx_min = weekly_df["index_score"].min()
+    idx_max = weekly_df["index_score"].max()
+    y1_lo = idx_min * 1.15
+    y1_hi = idx_max * 1.15
+    zero_frac = (0 - y1_lo) / (y1_hi - y1_lo) if y1_hi != y1_lo else 0.5
+    art_max = max(weekly_df["n_articles"].max(), 1) * 1.2
+    y2_lo = -zero_frac / (1 - zero_frac) * art_max if zero_frac < 1 else 0
+
     fig.update_layout(
         height=500, template="plotly_white",
         legend=dict(orientation="h", y=-0.15),
         yaxis_title="Index Score (Sigma dir x imp)",
         yaxis2_title="Nombre d'articles",
         hovermode="x unified",
+    )
+    fig.update_yaxes(range=[y1_lo, y1_hi], secondary_y=False)
+    fig.update_yaxes(
+        range=[y2_lo, art_max], secondary_y=True,
+        tickvals=list(range(0, int(art_max) + 1)),
     )
     fig.add_hline(y=0, line_dash="dot", line_color="gray", secondary_y=False)
     st.plotly_chart(fig, width="stretch")
@@ -492,128 +496,335 @@ with tab1:
     )
 
 # -------------------------------------------------------------------
-# TAB 2 — Regression & Event Study
+# TAB 2 — Regression with real FRED data
 # -------------------------------------------------------------------
 with tab2:
-    st.subheader("Regression a haute frequence : Delta P_oil = alpha + beta x Index + epsilon")
+    st.subheader("Regression a haute frequence avec donnees FRED reelles")
 
-    rng = np.random.default_rng(42)
-    n = len(weekly_df)
-    weekly_reg = weekly_df.copy()
-    weekly_reg["oil_return"] = (
-        synthetic_beta * weekly_reg["index_score"]
-        + rng.normal(0, noise_std, n)
-    )
+    # --- Fetch FRED data (cached) ---
+    @st.cache_data(ttl=3600, show_spinner="Chargement des prix FRED...")
+    def _load_fred(api_key: str, start: str):
+        from src.fred_data import fetch_energy_prices
+        temp_cfg = PipelineConfig(fred_api_key=api_key)
+        return fetch_energy_prices(temp_cfg, start=start)
 
-    X = sm.add_constant(weekly_reg["index_score"])
-    y = weekly_reg["oil_return"]
-    model = sm.OLS(y, X).fit(cov_type="HC1")
+    energy_df = pd.DataFrame()
+    has_fred = cfg.has_fred_key
 
-    col1, col2 = st.columns([1, 1])
+    if has_fred:
+        energy_df = _load_fred(cfg.fred_api_key, "2012-01-01")
 
-    with col1:
-        fig_scat = go.Figure()
-        fig_scat.add_trace(go.Scatter(
-            x=weekly_reg["index_score"], y=weekly_reg["oil_return"],
-            mode="markers",
-            marker=dict(size=6, color="#2c3e50", opacity=0.5),
-            name="Observations",
-        ))
-        x_range = np.linspace(
-            weekly_reg["index_score"].min(),
-            weekly_reg["index_score"].max(), 100,
-        )
-        y_fit = model.params["const"] + model.params["index_score"] * x_range
-        fig_scat.add_trace(go.Scatter(
-            x=x_range, y=y_fit, mode="lines",
-            line=dict(color="red", width=2.5, dash="dash"),
-            name=f"OLS: beta = {model.params['index_score']:.4f}",
-        ))
-        fig_scat.update_layout(
-            height=450, template="plotly_white",
-            xaxis_title="Index Score hebdo",
-            yaxis_title="Rendement petrole (Delta P/P)",
-            title="Green Subsidy News vs. Oil Returns",
-        )
-        fig_scat.add_hline(y=0, line_dash="dot", line_color="gray")
-        fig_scat.add_vline(x=0, line_dash="dot", line_color="gray")
-        st.plotly_chart(fig_scat, width="stretch")
+    if not energy_df.empty:
+        st.success(f"Donnees FRED chargees : {len(energy_df)} semaines de prix reels (electricite + WTI)")
 
-    with col2:
-        st.markdown("#### Resultats OLS (Ecarts-types robustes HC1)")
-        interpretation = (
-            "**Green Paradox** : les firmes fossiles accelerent l'extraction"
-            if model.params["index_score"] < 0
-            else "**Fossilflation** : gel de l'investissement -> retention d'offre"
-        )
-        results_table = pd.DataFrame({
-            "Parametre": ["alpha (constante)", "beta (index)", "R-carre",
-                          "R-carre ajuste", "N obs.", "F-stat"],
-            "Valeur": [
-                f"{model.params['const']:.6f}",
-                f"{model.params['index_score']:.6f}",
-                f"{model.rsquared:.4f}",
-                f"{model.rsquared_adj:.4f}",
-                f"{int(model.nobs)}",
-                f"{model.fvalue:.2f}",
-            ],
-            "Ecart-type": [
-                f"{model.bse['const']:.6f}",
-                f"{model.bse['index_score']:.6f}",
-                "—", "—", "—", "—",
-            ],
-            "t-stat": [
-                f"{model.tvalues['const']:.2f}",
-                f"{model.tvalues['index_score']:.2f}",
-                "—", "—", "—", "—",
-            ],
-            "p-value": [
-                f"{model.pvalues['const']:.4f}",
-                f"{model.pvalues['index_score']:.4f}",
-                "—", "—", "—", "—",
-            ],
-        })
-        st.dataframe(results_table, width="stretch", hide_index=True)
-        st.info(f"Interpretation : {interpretation}")
-
-    # Rolling beta
-    st.markdown("---")
-    st.subheader("Stabilite du coefficient beta (fenetre glissante)")
-    window = st.slider("Taille de la fenetre (semaines)", 12, 52, 26)
-
-    if len(weekly_reg) >= window:
-        rolling_betas = []
-        rolling_dates = []
-        for i in range(window, len(weekly_reg)):
-            chunk = weekly_reg.iloc[i - window:i]
-            X_r = sm.add_constant(chunk["index_score"])
-            y_r = chunk["oil_return"]
-            try:
-                m = sm.OLS(y_r, X_r).fit()
-                rolling_betas.append(m.params.get("index_score", np.nan))
-                rolling_dates.append(chunk["week_start"].iloc[-1])
-            except Exception:
-                rolling_betas.append(np.nan)
-                rolling_dates.append(chunk["week_start"].iloc[-1])
-
-        fig_rb = go.Figure()
-        fig_rb.add_trace(go.Scatter(
-            x=rolling_dates, y=rolling_betas,
-            mode="lines", line=dict(color="#8e44ad", width=2),
-            name=f"Beta glissant ({window} sem.)",
-        ))
-        fig_rb.add_hline(y=0, line_dash="dash", line_color="gray",
-                         annotation_text="Seuil Green Paradox / Fossilflation")
-        fig_rb.update_layout(
+        # --- Price evolution chart ---
+        st.markdown("#### Evolution des prix de l'energie (FRED)")
+        fig_prices = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_prices.add_trace(go.Scatter(
+            x=energy_df["week_start"], y=energy_df["elec_price"],
+            mode="lines", name="Electricite ($/kWh)",
+            line=dict(color="#e74c3c", width=1.5),
+        ), secondary_y=False)
+        fig_prices.add_trace(go.Scatter(
+            x=energy_df["week_start"], y=energy_df["oil_price"],
+            mode="lines", name="Petrole WTI ($/bbl)",
+            line=dict(color="#2c3e50", width=1.5),
+        ), secondary_y=True)
+        # Add natural gas if available — scaled by 10 for visual comparability with oil
+        if "gas_price" in energy_df.columns:
+            fig_prices.add_trace(go.Scatter(
+                x=energy_df["week_start"], y=energy_df["gas_price"] * 10,
+                mode="lines", name="Gaz naturel ($/MMBtu x10)",
+                line=dict(color="#16a085", width=1.5, dash="dot"),
+            ), secondary_y=True)
+        fig_prices.update_layout(
             height=350, template="plotly_white",
-            yaxis_title="beta estime",
-            title=f"Evolution temporelle de beta (fenetre = {window} semaines)",
+            legend=dict(orientation="h", y=-0.15),
+            hovermode="x unified",
         )
-        st.plotly_chart(fig_rb, width="stretch")
+        fig_prices.update_yaxes(title_text="Electricite ($/kWh)", secondary_y=False)
+        fig_prices.update_yaxes(title_text="WTI ($/bbl) / Gaz ($/MMBtu x10)", secondary_y=True)
+        st.plotly_chart(fig_prices, width="stretch")
+
+        # --- Ratio chart ---
+        st.markdown("#### Ratio Electricite / Petrole (indice de substitution)")
+        fig_ratio = go.Figure()
+        fig_ratio.add_trace(go.Scatter(
+            x=energy_df["week_start"], y=energy_df["ratio_elec_oil"],
+            fill="tozeroy", fillcolor="rgba(52,152,219,0.15)",
+            line=dict(color="#2980b9", width=2),
+            name="Ratio Elec/Oil",
+        ))
+        fig_ratio.update_layout(
+            height=300, template="plotly_white",
+            yaxis_title="Ratio (elec_price x 1000 / oil_price)",
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_ratio, width="stretch")
         st.caption(
-            "**Lecture :** Quand beta passe de negatif a positif, le marche "
-            "bascule du regime Green Paradox au regime Fossilflation."
+            "**Lecture :** Quand le ratio monte, l'electricite devient relativement plus chere "
+            "que le petrole. Les subventions vertes devraient faire **baisser** ce ratio "
+            "(electricite moins chere grace aux renouvelables)."
         )
+
+        st.markdown("---")
+
+    # --- Regression ---
+    # Build target options dynamically (only show gas-based options if gas data is present)
+    target_options = {}
+    if not energy_df.empty and "ratio_gas_return" in energy_df.columns:
+        target_options["Ratio Elec/Gaz naturel (recommande - canal direct)"] = "ratio_gas_return"
+    target_options["Ratio Elec/Petrole WTI (legacy)"] = "ratio_return"
+    target_options["Rendement Electricite seul"] = "elec_return"
+    if not energy_df.empty and "gas_return" in energy_df.columns:
+        target_options["Rendement Gaz naturel seul"] = "gas_return"
+    target_options["Rendement Petrole WTI seul"] = "oil_return"
+
+    target_label = st.selectbox(
+        "Variable dependante de la regression",
+        list(target_options.keys()),
+        index=0,
+        help=(
+            "Le ratio Elec/Gaz est theoriquement superieur : le gaz naturel "
+            "fournit ~40% de l'electricite US, contre ~0.5% pour le petrole. "
+            "C'est donc le vrai canal de substitution teste par les subventions vertes."
+        ),
+    )
+    target_col = target_options[target_label]
+
+    # Run regression
+    if not energy_df.empty:
+        reg_results, weekly_reg = run_regression(weekly_df, energy_df, target_col=target_col)
+        data_source_label = "Donnees reelles FRED"
+    else:
+        if cfg.has_fred_key:
+            st.error(
+                "⚠️ **FRED API injoignable** (timeout reseau ou panne). "
+                "La regression ci-dessous utilise des **donnees synthetiques calibrees** "
+                "(beta = -0.003 baked in). Les coefficients et p-values affichees "
+                "ne sont **PAS** issus de donnees reelles. Recharge la page dans quelques minutes."
+            )
+        else:
+            st.warning("Cle FRED_API_KEY absente du .env — regression sur donnees simulees.")
+        reg_results, weekly_reg = run_regression(weekly_df, None, target_col=target_col)
+        data_source_label = "⚠️ DONNEES SIMULEES (FRED indisponible)"
+
+    if "error" not in reg_results and target_col in weekly_reg.columns:
+        st.markdown(f"#### Regression : `{target_label}` = alpha + beta x Index_score")
+        st.caption(f"Source : {data_source_label} | Ecarts-types robustes HC1")
+
+        col1, col2 = st.columns([1, 1])
+
+        with col1:
+            fig_scat = go.Figure()
+            fig_scat.add_trace(go.Scatter(
+                x=weekly_reg["index_score"], y=weekly_reg[target_col],
+                mode="markers",
+                marker=dict(size=6, color="#2c3e50", opacity=0.5),
+                name="Observations",
+            ))
+            x_range = np.linspace(
+                weekly_reg["index_score"].min(),
+                weekly_reg["index_score"].max(), 100,
+            )
+            y_fit = reg_results["alpha"] + reg_results["beta"] * x_range
+            fig_scat.add_trace(go.Scatter(
+                x=x_range, y=y_fit, mode="lines",
+                line=dict(color="red", width=2.5, dash="dash"),
+                name=f"OLS: beta = {reg_results['beta']:.6f}",
+            ))
+            fig_scat.update_layout(
+                height=450, template="plotly_white",
+                xaxis_title="Index Score hebdo (S_t)",
+                yaxis_title=f"Rendement hebdo ({target_label})",
+                title="News de subventions vs. prix de l'energie",
+            )
+            fig_scat.add_hline(y=0, line_dash="dot", line_color="gray")
+            fig_scat.add_vline(x=0, line_dash="dot", line_color="gray")
+            st.plotly_chart(fig_scat, width="stretch")
+
+        with col2:
+            st.markdown("#### Resultats OLS")
+            results_table = pd.DataFrame({
+                "Parametre": ["alpha (constante)", "beta (index)", "R-carre",
+                              "R-carre ajuste", "N obs.", "F-stat"],
+                "Valeur": [
+                    f"{reg_results['alpha']:.6f}",
+                    f"{reg_results['beta']:.6f}",
+                    f"{reg_results['r_squared']:.4f}",
+                    f"{reg_results['adj_r_squared']:.4f}",
+                    f"{reg_results['n_obs']}",
+                    f"{reg_results['f_stat']:.2f}",
+                ],
+                "Ecart-type": [
+                    "—",
+                    f"{reg_results['beta_se']:.6f}",
+                    "—", "—", "—", "—",
+                ],
+                "t-stat": [
+                    "—",
+                    f"{reg_results['beta_tstat']:.2f}",
+                    "—", "—", "—", "—",
+                ],
+                "p-value": [
+                    "—",
+                    f"{reg_results['beta_pvalue']:.4f}",
+                    "—", "—", "—", "—",
+                ],
+            })
+            st.dataframe(results_table, width="stretch", hide_index=True)
+
+            # Significance badge
+            p = reg_results["beta_pvalue"]
+            if p < 0.01:
+                st.success(f"*** Significatif a 1% (p = {p:.4f})")
+            elif p < 0.05:
+                st.success(f"** Significatif a 5% (p = {p:.4f})")
+            elif p < 0.10:
+                st.warning(f"* Significatif a 10% (p = {p:.4f})")
+            else:
+                st.error(f"Non significatif (p = {p:.4f})")
+
+            st.info(f"**Interpretation :** {reg_results['interpretation']}")
+
+        # --- Economic magnitude panel (per reviewer feedback) ---
+        st.markdown("---")
+        st.subheader("💰 Magnitude economique du coefficient")
+        st.caption(
+            "Le coefficient beta seul n'est pas parlant. Cette section traduit "
+            "beta en effets tangibles sur le marche."
+        )
+
+        mag_cols = st.columns(4)
+        with mag_cols[0]:
+            st.metric(
+                "Effet d'un choc 1 ecart-type",
+                f"{reg_results['effect_1sd_pct']:+.3f} %",
+                help=(
+                    f"Si l'indice de news augmente de 1 ecart-type "
+                    f"({reg_results['sd_index']:.2f} points), la variable cible "
+                    f"varie de {reg_results['effect_1sd_pct']:+.3f} % la meme semaine."
+                ),
+            )
+        with mag_cols[1]:
+            st.metric(
+                "Effet d'un choc type IRA",
+                f"{reg_results['effect_ira_pct']:+.3f} %",
+                help=(
+                    "Une annonce 'direction = +1, importance = 3' "
+                    "(equivalent IRA, Green Deal, Clean Power Plan) "
+                    "produit cette variation hebdomadaire."
+                ),
+            )
+        with mag_cols[2]:
+            st.metric(
+                "Effet annualise (+1/sem.)",
+                f"{reg_results['effect_annualized_pct']:+.2f} %",
+                help=(
+                    "Si l'indice etait soutenu a +1 chaque semaine pendant 1 an, "
+                    "l'effet cumule (compose) sur 52 semaines serait celui-ci."
+                ),
+            )
+        with mag_cols[3]:
+            stn = reg_results["signal_to_noise"]
+            st.metric(
+                "Ratio signal/bruit",
+                f"{stn:.3f}" if not np.isnan(stn) else "n/a",
+                help=(
+                    "Part de la volatilite hebdomadaire de la cible "
+                    "expliquee par un choc d'1 ecart-type sur l'indice. "
+                    "Une valeur > 0.10 = signal significatif vs bruit de marche."
+                ),
+            )
+
+        # Concrete dollar translation if elec is in the target
+        if target_col in ("ratio_return", "ratio_gas_return", "elec_return") and not energy_df.empty:
+            avg_elec = energy_df["elec_price"].mean()
+            # Typical US household: 877 kWh/month (EIA) → ~10,500 kWh/year
+            annual_kwh = 10_500
+            annual_bill = avg_elec * annual_kwh
+            bill_change_ira = annual_bill * reg_results["effect_ira_pct"] / 100
+            bill_change_annual = annual_bill * reg_results["effect_annualized_pct"] / 100
+
+            st.markdown(
+                f"**Traduction concrete (menage US moyen, {annual_kwh:,} kWh/an, "
+                f"facture de base ≈ ${annual_bill:,.0f}/an) :**"
+            )
+            st.markdown(
+                f"- Choc IRA isole → variation de facture annuelle : **${bill_change_ira:+,.2f}**\n"
+                f"- Subventions soutenues toute l'annee → variation : **${bill_change_annual:+,.2f}**"
+            )
+
+        # Magnitude diagnostic: only meaningful if p < 0.10
+        pval = reg_results["beta_pvalue"]
+        if pval > 0.10:
+            st.error(
+                f"❌ **AUCUN SIGNAL DETECTABLE** (p = {pval:.3f} >> 0.10). "
+                "Les 'magnitudes' affichees ci-dessus sont **SANS SIGNIFICATION STATISTIQUE**. "
+                "Il n'y a rien à interpréter: les news de subventions du NYT n'impactent pas "
+                "mesurablement les prix/ratios d'énergie à l'horizon hebdomadaire. "
+                "\n\n**Pourquoi?** Les marchés énergétiques mondiaux sont dominés par: "
+                "(1) décisions OPEP, (2) géopolitique/guerres, (3) demande macro globale. "
+                "Un signal médiatique américain est un bruit blanc negligeable. "
+                "C'est un **résultat négatif honnête**, pas un bug."
+            )
+        else:
+            # Only diagnose magnitude if we actually have a detected signal
+            abs_ira = abs(reg_results["effect_ira_pct"])
+            if abs_ira < 0.1:
+                st.info(
+                    f"🔍 **Effet statistiquement significatif mais economiquement modeste** "
+                    f"({abs_ira:.3f}% par choc IRA). Le signal existe mais la magnitude "
+                    "est ecrasee par d'autres facteurs (OPEP, geopolitique, demande)."
+                )
+            else:
+                st.success(
+                    f"✅ **Effet economiquement substantiel** ({abs_ira:.2f}% par choc IRA). "
+                    "La magnitude est compatible avec un impact reel des politiques climatiques "
+                    "sur les prix de l'energie."
+                )
+
+        # --- Rolling beta ---
+        st.markdown("---")
+        st.subheader("Stabilite du coefficient beta (fenetre glissante)")
+        window = st.slider("Taille de la fenetre (semaines)", 12, 52, 26)
+
+        if len(weekly_reg) >= window:
+            rolling_betas = []
+            rolling_dates = []
+            for i in range(window, len(weekly_reg)):
+                chunk = weekly_reg.iloc[i - window:i]
+                X_r = sm.add_constant(chunk["index_score"])
+                y_r = chunk[target_col]
+                try:
+                    m = sm.OLS(y_r, X_r).fit()
+                    rolling_betas.append(m.params.get("index_score", np.nan))
+                    rolling_dates.append(chunk["week_start"].iloc[-1])
+                except Exception:
+                    rolling_betas.append(np.nan)
+                    rolling_dates.append(chunk["week_start"].iloc[-1])
+
+            fig_rb = go.Figure()
+            fig_rb.add_trace(go.Scatter(
+                x=rolling_dates, y=rolling_betas,
+                mode="lines", line=dict(color="#8e44ad", width=2),
+                name=f"Beta glissant ({window} sem.)",
+            ))
+            fig_rb.add_hline(y=0, line_dash="dash", line_color="gray",
+                             annotation_text="beta = 0 (aucun effet)")
+            fig_rb.update_layout(
+                height=350, template="plotly_white",
+                yaxis_title="beta estime",
+                title=f"Evolution temporelle de beta (fenetre = {window} semaines)",
+            )
+            st.plotly_chart(fig_rb, width="stretch")
+            st.caption(
+                "**Lecture :** Un beta negatif persistant signifie que les subventions "
+                "reduisent durablement le cout relatif de l'electricite. Un basculement "
+                "vers un beta positif signale un changement structurel des anticipations."
+            )
+    else:
+        st.error(f"Regression impossible : {reg_results.get('error', 'unknown')}")
 
 # -------------------------------------------------------------------
 # TAB 3 — Article-level analysis
@@ -670,7 +881,10 @@ with tab3:
         st.subheader("Heatmap mensuelle : intensite du signal")
         rel_copy = rel.copy()
         rel_copy["score"] = rel_copy["direction"] * rel_copy["importance"]
-        rel_copy["month"] = rel_copy["date"].dt.to_period("M").astype(str)
+        month_source = rel_copy["date"]
+        if getattr(month_source.dt, "tz", None) is not None:
+            month_source = month_source.dt.tz_convert(None)
+        rel_copy["month"] = month_source.dt.to_period("M").astype(str)
         monthly = rel_copy.groupby("month").agg(
             total_score=("score", "sum"),
             count=("score", "count"),
@@ -768,86 +982,195 @@ with tab4:
     """)
 
 # -------------------------------------------------------------------
-# TAB 5 — Sensitivity & Scenarios
+# TAB 5 — Sensitivity: 3D Heatmap (beta x noise -> p-value)
 # -------------------------------------------------------------------
 with tab5:
-    st.subheader("Analyse de sensibilite : beta en fonction des parametres")
+    st.subheader("Analyse de sensibilite : Detectabilite du signal climatique")
+    st.markdown(
+        "Cette simulation Monte Carlo repond a la question fondamentale : "
+        "**pour quelles combinaisons de beta (sensibilite au choc) et de bruit "
+        "de marche (sigma_epsilon) le signal des subventions vertes est-il "
+        "statistiquement detectable ?**"
+    )
 
-    st.markdown("#### Scenario 1 : Variation du beta theorique")
-    betas_range = np.linspace(-0.05, 0.05, 50)
     rng = np.random.default_rng(42)
     n = len(weekly_df)
     idx_scores = weekly_df["index_score"].values
-    r_squareds = []
-    p_values_list = []
 
-    for b in betas_range:
-        y_sim = b * idx_scores + rng.normal(0, noise_std, n)
-        X_sim = sm.add_constant(idx_scores)
-        m = sm.OLS(y_sim, X_sim).fit()
-        r_squareds.append(m.rsquared)
-        p_values_list.append(float(m.pvalues[1]) if len(m.pvalues) > 1 else 1.0)
+    # --- Grid parameters ---
+    st.markdown("#### Parametres de la grille de simulation")
+    col_g1, col_g2, col_g3 = st.columns(3)
+    with col_g1:
+        beta_min = st.number_input("beta min", value=-0.05, step=0.01, format="%.3f")
+        beta_max = st.number_input("beta max", value=0.05, step=0.01, format="%.3f")
+    with col_g2:
+        noise_min = st.number_input("sigma min", value=0.005, step=0.005, format="%.3f")
+        noise_max = st.number_input("sigma max", value=0.10, step=0.01, format="%.3f")
+    with col_g3:
+        grid_res = st.slider("Resolution de la grille", 15, 50, 30)
+        n_simulations = st.slider("Simulations par cellule", 1, 50, 10)
 
-    fig_sens = make_subplots(specs=[[{"secondary_y": True}]])
-    fig_sens.add_trace(go.Scatter(
-        x=betas_range, y=r_squareds,
-        mode="lines", name="R-carre",
-        line=dict(color="#2ecc71", width=2),
-    ), secondary_y=False)
-    fig_sens.add_trace(go.Scatter(
-        x=betas_range, y=p_values_list,
-        mode="lines", name="p-value (beta)",
-        line=dict(color="#e74c3c", width=2, dash="dash"),
-    ), secondary_y=True)
-    fig_sens.add_hline(y=0.05, line_dash="dot", line_color="orange",
-                       annotation_text="Seuil 5%", secondary_y=True)
-    fig_sens.add_vline(x=0, line_dash="dot", line_color="gray")
-    fig_sens.update_layout(
-        height=400, template="plotly_white",
-        title="Pouvoir statistique en fonction de beta",
-        xaxis_title="beta theorique",
-    )
-    fig_sens.update_yaxes(title_text="R-carre", secondary_y=False)
-    fig_sens.update_yaxes(title_text="p-value", secondary_y=True)
-    st.plotly_chart(fig_sens, width="stretch")
-
-    st.caption(
-        "**Lecture :** Plus |beta| est grand, plus le R-carre augmente et la p-value "
-        "diminue. La zone ou p < 0.05 definit le seuil de detectabilite."
+    z_metric = st.radio(
+        "Metrique de l'axe Z",
+        ["p-value du coefficient beta", "R-carre"],
+        index=0, horizontal=True,
     )
 
-    # Scenario 2: Noise sensitivity
+    betas_grid = np.linspace(beta_min, beta_max, grid_res)
+    noises_grid = np.linspace(noise_min, noise_max, grid_res)
+
+    # --- Monte Carlo simulation ---
+    with st.spinner("Simulation Monte Carlo en cours..."):
+        Z = np.zeros((len(noises_grid), len(betas_grid)))
+
+        for i, sigma in enumerate(noises_grid):
+            for j, beta in enumerate(betas_grid):
+                metrics = []
+                for sim in range(n_simulations):
+                    y_sim = beta * idx_scores + rng.normal(0, sigma, n)
+                    X_sim = sm.add_constant(idx_scores)
+                    m = sm.OLS(y_sim, X_sim).fit()
+                    if z_metric.startswith("p-value"):
+                        val = float(m.pvalues[1]) if len(m.pvalues) > 1 else 1.0
+                    else:
+                        val = m.rsquared
+                    metrics.append(val)
+                Z[i, j] = np.mean(metrics)
+
+    # ---- HEATMAP 2D ----
     st.markdown("---")
-    st.markdown("#### Scenario 2 : Impact du bruit de marche")
-    noise_range = np.arange(0.005, 0.10, 0.005)
-    detect = []
-    for ns in noise_range:
-        y_sim = synthetic_beta * idx_scores + rng.normal(0, ns, n)
-        X_sim = sm.add_constant(idx_scores)
-        m = sm.OLS(y_sim, X_sim).fit()
-        detect.append(float(m.pvalues[1]) if len(m.pvalues) > 1 else 1.0)
+    st.markdown("#### Heatmap 2D : Zone de detection statistique")
 
-    fig_noise = go.Figure()
-    fig_noise.add_trace(go.Scatter(
-        x=noise_range, y=detect,
-        mode="lines+markers",
-        line=dict(color="#8e44ad", width=2),
-        name="p-value de beta",
+    if z_metric.startswith("p-value"):
+        # Clip for visual clarity
+        Z_display = np.clip(Z, 0, 1)
+        colorscale = [
+            [0.0, "#1a9850"],    # p ~ 0 : highly significant (green)
+            [0.05, "#91cf60"],   # p = 0.05 : threshold
+            [0.10, "#fee08b"],   # p = 0.10 : marginal
+            [0.30, "#fc8d59"],   # p = 0.30 : weak
+            [1.0, "#d73027"],    # p = 1.0 : no signal (red)
+        ]
+        zmid = 0.05
+        colorbar_title = "p-value"
+    else:
+        Z_display = Z
+        colorscale = "Viridis"
+        zmid = None
+        colorbar_title = "R-carre"
+
+    fig_heatmap = go.Figure(go.Heatmap(
+        z=Z_display,
+        x=np.round(betas_grid, 4),
+        y=np.round(noises_grid, 4),
+        colorscale=colorscale,
+        zmid=zmid,
+        colorbar_title=colorbar_title,
+        hovertemplate=(
+            "beta: %{x:.4f}<br>"
+            "sigma: %{y:.4f}<br>"
+            + colorbar_title + ": %{z:.4f}<extra></extra>"
+        ),
     ))
-    fig_noise.add_hline(y=0.05, line_dash="dot", line_color="orange",
-                        annotation_text="Seuil de significativite 5%")
-    fig_noise.update_layout(
-        height=350, template="plotly_white",
-        title=f"Detectabilite du signal (beta = {synthetic_beta:.3f})",
-        xaxis_title="Ecart-type du bruit de marche",
-        yaxis_title="p-value",
+
+    # Add significance contour line at p=0.05
+    if z_metric.startswith("p-value"):
+        fig_heatmap.add_contour(
+            z=Z_display,
+            x=np.round(betas_grid, 4),
+            y=np.round(noises_grid, 4),
+            contours=dict(
+                start=0.05, end=0.05, size=0,
+                coloring="none",
+                showlabels=True,
+                labelfont=dict(size=12, color="white"),
+            ),
+            line=dict(color="white", width=2, dash="dash"),
+            showscale=False,
+            name="p = 0.05",
+        )
+
+    fig_heatmap.update_layout(
+        height=550, template="plotly_white",
+        title=f"Detectabilite : {colorbar_title} en fonction de beta et du bruit (N={n} semaines)",
+        xaxis_title="beta (sensibilite du petrole aux news de subventions)",
+        yaxis_title="sigma_epsilon (volatilite exogene du marche)",
     )
-    st.plotly_chart(fig_noise, width="stretch")
+    # Mark Green Paradox / Fossilflation zones
+    fig_heatmap.add_vline(x=0, line_dash="dot", line_color="white", opacity=0.5)
+    fig_heatmap.add_annotation(
+        x=beta_min * 0.6, y=noise_max * 0.9,
+        text="GREEN PARADOX<br>(beta < 0)",
+        showarrow=False, font=dict(color="white", size=11),
+    )
+    fig_heatmap.add_annotation(
+        x=beta_max * 0.6, y=noise_max * 0.9,
+        text="FOSSILFLATION<br>(beta > 0)",
+        showarrow=False, font=dict(color="white", size=11),
+    )
+    st.plotly_chart(fig_heatmap, width="stretch")
+
     st.caption(
-        "**Interpretation :** Ce graphique montre pourquoi la haute frequence est cruciale. "
-        "A basse frequence (mensuelle), le bruit agrege est plus eleve, "
-        "rendant le signal climatique indetectable."
+        "**Lecture :** La zone **verte** (p < 0.05) represente les combinaisons ou le signal "
+        "climatique est statistiquement detectable. La zone **rouge** (p >> 0.05) est la "
+        "zone d'aveuglement ou le bruit de marche noie le signal. "
+        "**C'est pourquoi Acharya et al. utilisent la haute frequence** : en reduisant sigma, "
+        "on elargit la zone verte de detection."
     )
+
+    # ---- SURFACE 3D ----
+    st.markdown("---")
+    st.markdown("#### Surface 3D : Paysage de detectabilite")
+
+    fig_3d = go.Figure(go.Surface(
+        z=Z_display,
+        x=np.round(betas_grid, 4),
+        y=np.round(noises_grid, 4),
+        colorscale="RdYlGn_r" if z_metric.startswith("p-value") else "Viridis",
+        colorbar_title=colorbar_title,
+        opacity=0.9,
+    ))
+
+    # Add p=0.05 plane if p-value mode
+    if z_metric.startswith("p-value"):
+        plane_z = np.full_like(Z_display, 0.05)
+        fig_3d.add_trace(go.Surface(
+            z=plane_z,
+            x=np.round(betas_grid, 4),
+            y=np.round(noises_grid, 4),
+            colorscale=[[0, "rgba(255,165,0,0.3)"], [1, "rgba(255,165,0,0.3)"]],
+            showscale=False, name="Seuil p=0.05",
+            opacity=0.4,
+        ))
+
+    fig_3d.update_layout(
+        height=600,
+        title=f"Surface de {colorbar_title} : beta x sigma → detectabilite",
+        scene=dict(
+            xaxis_title="beta",
+            yaxis_title="sigma_epsilon",
+            zaxis_title=colorbar_title,
+            camera=dict(eye=dict(x=1.5, y=-1.5, z=1.0)),
+        ),
+    )
+    st.plotly_chart(fig_3d, width="stretch")
+
+    st.markdown("""
+    #### Interpretation economique pour le jury
+
+    Ce graphique 3D materialise le concept central d'Acharya et al. (2025) :
+
+    - **Crete gauche (beta < 0)** : regime de *Green Paradox* — les subventions poussent
+      les firmes fossiles a extraire plus vite, faisant baisser le prix spot.
+    - **Crete droite (beta > 0)** : regime de *Fossilflation* — les subventions gelent
+      l'investissement fossile, provoquant une retention d'offre et une hausse des prix.
+    - **Vallee centrale (beta ≈ 0)** : aucun signal detectable, quelle que soit la volatilite.
+    - **Quand sigma augmente** (bruit de marche) : les cretes s'aplatissent, le signal
+      climatique est noye. C'est precisement ce qui se produit a basse frequence (mensuelle).
+
+    **Conclusion :** la haute frequence (hebdomadaire) est indispensable pour detecter
+    empiriquement l'effet des subventions vertes sur les prix de l'energie.
+    """)
 
 # ===================================================================
 # FOOTER
